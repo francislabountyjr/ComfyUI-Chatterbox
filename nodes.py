@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 
 CHATTERBOX_PATCHER_CACHE = {}
 
+_device = mm.get_torch_device()
+if str(_device) in ["mps", "cpu"]:
+    map_location = _device
+
+    torch_load_original = torch.load
+
+    def patched_torch_load(*args, **kwargs):
+        if "map_location" not in kwargs:
+            kwargs["map_location"] = map_location
+        return torch_load_original(*args, **kwargs)
+
+    torch.load = patched_torch_load
+
 
 class ChatterboxModelWrapper(torch.nn.Module):
     """
