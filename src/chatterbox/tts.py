@@ -1,6 +1,6 @@
-import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import librosa
 import torch
@@ -10,13 +10,12 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from .models.t3 import T3
-from .models.s3tokenizer import S3_SR, S3_TOKEN_RATE, drop_invalid_tokens
+from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 
-logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -104,22 +103,6 @@ class Conditionals:
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
-# helper function for padding
-def _pad_wav_to_40ms_multiple(wav: torch.Tensor, sr: int) -> torch.Tensor:
-    """
-    Pads a waveform to be a multiple of 40ms to prevent rounding errors between
-    the mel spectrogram (20ms hop) and the speech tokenizer (40ms hop).
-    """
-    S3_TOKEN_DURATION_S = 1 / S3_TOKEN_RATE  # 0.04 seconds
-    samples_per_token = int(sr * S3_TOKEN_DURATION_S)
-    current_samples = wav.shape[-1]
-    remainder = current_samples % samples_per_token
-    if remainder != 0:
-        padding_needed = samples_per_token - remainder
-        padded_wav = F.pad(wav, (0, padding_needed))
-        return padded_wav
-    return wav
-
 
 class ChatterboxTTS:
     ENC_COND_LEN = 6 * S3_SR
@@ -148,7 +131,7 @@ class ChatterboxTTS:
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
-        if str(device) in ["cpu", "mps"]:
+        if device in ["cpu", "mps"]:
             map_location = torch.device('cpu')
         else:
             map_location = None
@@ -187,9 +170,9 @@ class ChatterboxTTS:
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
-                logger.warning("MPS not available because the current PyTorch install was not built with MPS enabled.")
+                print("MPS not available because the current PyTorch install was not built with MPS enabled.")
             else:
-                logger.warning("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
+                print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
             device = "cpu"
 
         for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
@@ -200,18 +183,11 @@ class ChatterboxTTS:
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-        
-        # Convert to tensor and pad to a 40ms boundary
-        s3gen_ref_wav = torch.from_numpy(s3gen_ref_wav).float().unsqueeze(0)
-        s3gen_ref_wav = _pad_wav_to_40ms_multiple(s3gen_ref_wav, S3GEN_SR)
-        
-        # Now convert back to numpy for librosa, or use torch audio for resampling
-        s3gen_ref_wav_np = s3gen_ref_wav.squeeze(0).numpy()
 
-        ref_16k_wav = librosa.resample(s3gen_ref_wav_np, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
-        s3gen_ref_wav_np = s3gen_ref_wav_np[:self.DEC_COND_LEN]
-        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav_np, S3GEN_SR, device=self.device)
+        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
+        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
 
         # Speech cond prompt tokens
         if plen := self.t3.hp.speech_cond_prompt_len:
@@ -233,17 +209,27 @@ class ChatterboxTTS:
     def generate(
         self,
         text,
-        repetition_penalty=1.2,
-        min_p=0.05,
-        top_p=1.0,
         audio_prompt_path=None,
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
-        pbar=None,
-        max_new_tokens=1000,
-        flow_cfg_scale=0.7
+        # stream - left for API compatibility
+        tokens_per_slice=None,
+        remove_milliseconds=None,
+        remove_milliseconds_start=None,
+        chunk_overlap_method=None,
+        # cache optimization params
+        max_new_tokens=1000, 
+        max_cache_len=1500, # Affects the T3 speed, hence important
+        # t3 sampling params
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        t3_params={},
     ):
+        if tokens_per_slice is not None or remove_milliseconds is not None or remove_milliseconds_start is not None or chunk_overlap_method is not None:
+            print("Streaming by token slices has been discontinued due to audio clipping. Continuing with full generation.")
+
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
@@ -256,7 +242,8 @@ class ChatterboxTTS:
                 speaker_emb=_cond.speaker_emb,
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
                 emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+                # TODO - check if dtype is correct here
+            ).to(device=self.device, dtype=self.conds.t3.speaker_emb.dtype)
 
         # Norm and tokenize text
         text = punc_norm(text)
@@ -274,29 +261,44 @@ class ChatterboxTTS:
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=max_new_tokens,  # TODO: use the value in config
                 temperature=temperature,
                 cfg_weight=cfg_weight,
+                max_cache_len=max_cache_len,
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
-                pbar=pbar
+                **t3_params,
             )
-            # Extract only the conditional batch.
-            speech_tokens = speech_tokens[0]
 
-            # TODO: output becomes 1D
-            speech_tokens = drop_invalid_tokens(speech_tokens)
             
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+            def speech_to_wav(speech_tokens):
+                # Extract only the conditional batch.
+                speech_tokens = speech_tokens[0]
 
-            speech_tokens = speech_tokens.to(self.device)
+                # TODO: output becomes 1D
+                speech_tokens = drop_invalid_tokens(speech_tokens)
+                
+                def drop_bad_tokens(tokens):
+                    # Use torch.where instead of boolean indexing to avoid sync
+                    mask = tokens < 6561
+                    # Count valid tokens without transferring to CPU
+                    valid_count = torch.sum(mask).item()
+                    # Create output tensor of the right size
+                    result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
+                    # Use torch.masked_select which is more CUDA-friendly
+                    result = torch.masked_select(tokens, mask)
+                    return result
 
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
-                flow_cfg_scale=flow_cfg_scale 
-            )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+                # speech_tokens = speech_tokens[speech_tokens < 6561]
+                speech_tokens = drop_bad_tokens(speech_tokens)
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=speech_tokens,
+                    ref_dict=self.conds.gen,
+                )
+                wav = wav.squeeze(0).detach().cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+            return speech_to_wav(speech_tokens)
+

@@ -8,6 +8,8 @@
     <img src="./workflow-examples/ChatterboxTTS-workflow.png" alt="Chatterbox Nodes in ComfyUI">
   </a>
 
+  <p>This fork is for implementing the Chatterbox inference optimizations from this branch https://github.com/rsxdalv/chatterbox/tree/faster</p>
+
   <h3 align="center">ComfyUI Chatterbox</h3>
 
   <p align="center">

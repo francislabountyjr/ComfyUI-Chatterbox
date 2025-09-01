@@ -8,11 +8,7 @@ LLAMA_520M_CONFIG_DICT = dict(
     intermediate_size=4096,
     num_hidden_layers=30,
     num_attention_heads=16,
-    # This is required because AlignmentStreamAnalyzer needs to inspect attention weights,
-    # which is not supported by optimized backends like FlashAttention (SDPA).
-    # This informs transformers that the fallback to the slower path is intentional, silencing the warning.
-    attn_implementation="eager",    
-    #attn_implementation="sdpa",
+    attn_implementation="sdpa",
     head_dim=64,
     tie_word_embeddings=False,
     hidden_act="silu",
